@@ -1,6 +1,7 @@
 #%%
 import pyscf.gto
 import pyscf.scf
+import pyscf.cc
 import numpy as np
 import pyscf.dft
 import requests
@@ -9,11 +10,6 @@ import gzip
 import tarfile
 import itertools as it
 
-#%%
-mol = pyscf.gto.Mole(atom="""H 0 0 0; F 0 0 1.1""", basis="ccpvdz").build()
-calc = pyscf.scf.RHF(mol)
-calc.kernel()
-# %%
 
 
 def database_qmrxn20(kind: str, random_subsample=1000):
@@ -45,7 +41,7 @@ def database_qmrxn20(kind: str, random_subsample=1000):
     return cs, energies, filenames
 
 
-def lines2mol(lines: list[str], basisset: str) -> pyscf.gto.Mole:
+def lines2mol(lines, basisset: str) -> pyscf.gto.Mole:
     atomlines = ";".join([_.strip() for _ in lines[2:]])
     mol = pyscf.gto.Mole(atom=atomlines, basis=basisset).build()
     return mol
@@ -53,7 +49,7 @@ def lines2mol(lines: list[str], basisset: str) -> pyscf.gto.Mole:
 
 # %%
 if __name__ == "__main__":
-    db = database_qmrxn20("reactant-conformers", 10)
+    db = database_qmrxn20("reactant-conformers", 1000)
 
     for lines, energy, filename in zip(*db):
         mol = lines2mol(lines, "cc-pvdz")
