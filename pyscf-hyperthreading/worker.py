@@ -22,18 +22,20 @@ def get_mol(molname: str) -> pyscf.gto.Mole:
 # %%
 # cases: 1,2,4,8,16,32 cores with HT on and off for HF, PBE, CCSD. Output: time, memory, molname
 if __name__ == "__main__":
-    start = time.time()
     molname = sys.argv[1]
     method = sys.argv[2]
+
+    mol = get_mol(molname)
+    start = time.time()
     if method == "HF":
-        calc = pyscf.scf.RHF(get_mol(molname))
+        calc = pyscf.scf.RHF(mol)
         calc.kernel()
     if method == "PBE":
-        calc = pyscf.scf.RKS(get_mol(molname))
+        calc = pyscf.scf.RKS(mol)
         calc.xc = "pbe"
         calc.kernel()
     if method == "CCSD":
-        calc = pyscf.cc.RCCSD(pyscf.scf.RHF(get_mol(molname)).run())
+        calc = pyscf.cc.RCCSD(pyscf.scf.RHF(mol).run())
         calc.kernel()
 
     memory_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
