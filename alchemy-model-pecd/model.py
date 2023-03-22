@@ -7,6 +7,7 @@ import findiff
 import math
 import functools
 import scipy.interpolate as sci
+from sklearn.kernel_ridge import KernelRidge
 
 
 def get_data(kind: str, reduced: bool = False) -> pd.DataFrame:
@@ -359,4 +360,179 @@ def through_energy(dr: float, dq: float) -> None:
 
 
 through_energy(0.5, 0.3)
-# %%# %%
+# %%
+
+
+def build_krr(
+    energies: np.ndarray, drs: np.ndarray, dqs: np.ndarray, betas: np.ndarray
+) -> KernelRidge:
+    """
+    Builds a kernel ridge regression model to learn the relationship between the
+    photoelectron energies, displacement and charge perturbations, and the
+    corresponding alchemical pecd values.
+
+    Parameters
+    ----------
+    energies : np.ndarray
+        A 1D array of photoelectron energies used in the training set.
+    drs : np.ndarray
+        A 1D array of displacement perturbations used in the training set.
+    dqs : np.ndarray
+        A 1D array of charge perturbations used in the training set.
+    betas : np.ndarray
+        A 1D array of alchemical pecd values corresponding to the input energies, drs,
+        and dqs.
+
+    Returns
+    -------
+    model : sklearn.kernel_ridge.KernelRidge
+        A trained kernel ridge regression model that can be used to predict alchemical
+        pecd values for new sets of energy, displacement, and charge parameters.
+    """
+    # Stack the input arrays into a single feature matrix
+    X = np.column_stack([energies, drs, dqs])
+
+    # Create a kernel ridge regression model with a Gaussian radial basis function (RBF) kernel
+    model = KernelRidge(kernel="rbf")
+
+    # Train the model on the input data
+    model.fit(X, betas)
+
+    return model
+
+
+#%%
+def get_long_format_data():
+    A = (
+        get_data("charge")
+        .reset_index()
+        .melt(id_vars=["Energy"], var_name="dq", value_name="beta")
+    )
+    B = (
+        get_data("position")
+        .reset_index()
+        .melt(id_vars=["Energy"], var_name="dr", value_name="beta")
+    )
+    return pd.concat([A, B], ignore_index=True).fillna(0)
+
+
+df = get_long_format_data()
+
+
+# %%
+import pandas as pd
+import numpy as np
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.kernel_ridge import KernelRidge
+
+
+def build_krr_model():
+    # Define the features and target
+    X = df.drop("beta", axis=1)
+    X = pd.DataFrame(X, columns=df.columns.drop("beta"))
+    y = df["beta"]
+
+    # Split the data into training, validation, and test sets
+    X_trainval, X_test, y_trainval, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_trainval, y_trainval, test_size=0.25, random_state=42
+    )
+
+    # Define the column transformer to standardize the features
+    ct = ColumnTransformer([("scaler", StandardScaler(), X.columns)])
+
+    # Define the pipeline for kernel ridge regression
+    pipeline = Pipeline([("transformer", ct), ("model", KernelRidge(kernel="rbf"))])
+
+    # Fit the column transformer on the training set only
+    X_train_transformed = ct.fit_transform(X_train)
+
+    # Define the hyperparameters to optimize
+    param_grid = {
+        "model__alpha": np.logspace(-5, 2, 8),
+        "model__gamma": np.logspace(-5, 2, 8),
+    }
+
+    # Perform a grid search with cross-validation on the training set to optimize the hyperparameters
+    grid_search = GridSearchCV(
+        pipeline, param_grid=param_grid, cv=10, scoring="neg_mean_squared_error"
+    )
+    grid_search.fit(pd.DataFrame(X_train_transformed, columns=X.columns), y_train)
+
+    # Transform the validation and test sets using the fitted column transformer
+    X_val_transformed = ct.transform(X_val)
+    X_test_transformed = ct.transform(X_test)
+
+    # Evaluate the pipeline on the validation and test sets
+    score_val = grid_search.score(
+        pd.DataFrame(X_val_transformed, columns=X.columns), y_val
+    )
+    score_test = grid_search.score(
+        pd.DataFrame(X_test_transformed, columns=X.columns), y_test
+    )
+
+    # Print the best hyperparameters and the corresponding score
+    print(f"Training set size: {len(X_train)}")
+    print(f"Validation set size: {len(X_val)}")
+    print(f"Test set size: {len(X_test)}")
+    print(f"Best hyperparameters: {grid_search.best_params_}")
+    print(f"Best score on training set: {grid_search.best_score_}")
+    print(f"Score on validation set: {score_val}")
+    print(f"Score on test set: {score_test}")
+    return grid_search, ct
+
+
+def apply_krr_model(grid_search, energy, dr, dq) -> float:
+    # Create a DataFrame with the input values
+    input_data = pd.DataFrame({"Energy": [energy], "dq": [dq], "dr": [dr]})
+    input_data_transformed = grid_search[1].transform(input_data)
+
+    # Make a prediction using the fitted pipeline
+    prediction = grid_search[0].predict(
+        pd.DataFrame(input_data_transformed, columns=input_data.columns)
+    )[0]
+
+    return prediction
+
+
+# %%
+
+
+def plot_krr_results():
+    model = build_krr_model()
+    for energy in range(4, 11):
+        target = functools.partial(apply_krr_model, model, energy)
+        drs = np.linspace(-0.5, 0.5, 20)
+        dqs = np.linspace(-0.5, 0.5, 20)
+        X, Y = np.meshgrid(drs, dqs)
+        Z = np.array(
+            [(target(dr, dq) * 100) for dr, dq in zip(X.ravel(), Y.ravel())]
+        ).reshape(X.shape)
+        print(np.amax(Z), np.amin(Z))
+        levels = range(-10, 11)
+        plt.contourf(X, Y, Z, levels=levels, cmap="RdBu")
+        plt.colorbar()
+
+        plt.xlabel("dr [a.u.]")
+        plt.ylabel("dq [a.u.]")
+        plt.title("$\\beta_1$@E={}".format(energy))
+        plt.scatter(
+            (0, 0, 0, 0, 0),
+            (-0.2, -0.1, 0, 0.1, 0.2),
+            color="white",
+            edgecolors="grey",
+            zorder=100,
+        )
+        plt.scatter(
+            (-0.2, -0.1, 0, 0.1, 0.2),
+            (0, 0, 0, 0, 0),
+            color="white",
+            edgecolors="grey",
+            zorder=100,
+        )
+        plt.show()
