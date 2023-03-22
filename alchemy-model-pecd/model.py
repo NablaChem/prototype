@@ -9,7 +9,32 @@ import functools
 import scipy.interpolate as sci
 
 
-def get_data(kind: str, reduced=False):
+def get_data(kind: str, reduced: bool = False) -> pd.DataFrame:
+    """
+    Loads an origin data file and returns it as a pandas DataFrame.
+
+    Parameters
+    ----------
+    kind : str
+        The kind of data to load. This should correspond to the basename of a text file
+        in the directory specified by the BASEDIR global variable.
+    reduced : bool, optional
+        Whether to return a reduced version of the DataFrame, by dropping its first
+        and last columns. Default is False.
+
+    Returns
+    -------
+    df : pandas.DataFrame
+        The loaded data as a pandas DataFrame. The DataFrame's columns correspond to
+        the numerical values extracted from the header of the input text file.
+        The DataFrame's rows correspond to the data points contained in the file.
+        If `reduced` is True, the DataFrame has its first and last columns removed.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the specified file does not exist.
+    """
     df = pd.read_csv(f"{BASEDIR}/{kind}.txt", index_col=0, delim_whitespace=True)
     df.columns = [float(_.split("=")[1]) for _ in df.columns]
     if reduced:
@@ -17,15 +42,36 @@ def get_data(kind: str, reduced=False):
     return df
 
 
-# get_data("charge", reduced=True)
-# df_pos = get_data("position")
-# %%
 # compare to KRR/GPR
 # uncertainty from distance in dq/dr
 # discuss error as function of displacement
 
 # %%
-def central_finite_difference(displacement: float, values: np.ndarray):
+def central_finite_difference(displacement: float, values: np.ndarray) -> np.poly1d:
+    """
+    Computes a polynomial approximation of the derivative of a function
+    using central finite differences.
+
+    Parameters
+    ----------
+    displacement : float
+        The spacing between adjacent values in the `values` array.
+    values : numpy.ndarray
+        An array of function values at equidistant points.
+
+    Returns
+    -------
+    p : numpy.poly1d
+        A polynomial function that approximates the derivative of the input function
+        using central finite differences. The polynomial's coefficients are determined
+        by fitting it to the input data. The polynomial's degree is determined by the
+        number of derivative orders that can be computed using the input values.
+
+    Raises
+    ------
+    AssertionError
+        If the length of the input `values` array is not odd.
+    """
     assert len(values) % 2 == 1
     order = 0
     pcoeffs = [values[len(values) // 2]]
@@ -45,7 +91,33 @@ def central_finite_difference(displacement: float, values: np.ndarray):
     return np.poly1d(pcoeffs[::-1])
 
 
-def alchemical_pecd(energy: float, dr: float, dq: float, reduced=False):
+def alchemical_pecd(
+    energy: float, dr: float, dq: float, reduced: bool = False
+) -> float:
+    """
+    Computes the percentage change in PECD resulting from
+    a simultaneous displacement and charge perturbation of a molecule, using the
+    alchemical perturbation approach.
+
+    Parameters
+    ----------
+    energy : float
+        The photoelectron energy, in eV.
+    dr : float
+        The displacement distance of the perturbed molecule, in a.u..
+    dq : float
+        The charge change of the perturbed molecule, in elementary charges.
+    reduced : bool, optional
+        Whether to use a reduced version of the input data, by dropping its first
+        and last columns. Default is False.
+
+    Returns
+    -------
+    pecd : float
+        The percentage change in electrostatic potential energy resulting from the
+        specified displacement and charge perturbation, as predicted by the alchemical
+        perturbation method.
+    """
     line = get_data("charge", reduced=reduced).loc[energy].to_list()
     taylor_charge = central_finite_difference(0.1, np.array(line))
     line = get_data("position", reduced=reduced).loc[energy].to_list()
@@ -60,80 +132,170 @@ def alchemical_pecd(energy: float, dr: float, dq: float, reduced=False):
 
 
 #%%
-def estimated_uncertainty(energy, dr, dq):
+def estimated_uncertainty(energy: float, dr: float, dq: float) -> float:
+    """
+    Estimates the uncertainty in the percentage change of electrostatic potential energy
+    resulting from a simultaneous displacement and charge perturbation of a molecule,
+    using the alchemical perturbation approach.
+
+    Parameters
+    ----------
+    energy : float
+        The photoelectron energy, in eV.
+    dr : float
+        The displacement distance of the perturbed molecule, in a.u..
+    dq : float
+        The charge change of the perturbed molecule, in elementary charges.
+
+    Returns
+    -------
+    unc : float
+        An estimate of the uncertainty in the percentage change of electrostatic potential
+        energy resulting from the specified perturbations. The uncertainty is defined as
+        the absolute difference between the alchemical perturbation estimates obtained
+        using the full and reduced versions of the input data.
+
+    Notes
+    -----
+    This function estimates the uncertainty in the alchemical perturbation estimates
+    by computing the difference between two estimates obtained using the full and reduced
+    versions of the input data. The full version is expected to be more accurate, but also
+    more computationally expensive, as it includes all available data. The reduced version
+    is expected to be less accurate, but also faster to compute, as it excludes some of the
+    data at the edges of the electrostatic potential energy surface. By comparing the two
+    estimates, this function provides a rough estimate of the uncertainty in the alchemical
+    perturbation approach, which can be used to assess the reliability of the results
+    obtained using this method.
+    """
     return abs(
         alchemical_pecd(energy, dr, dq, reduced=False)
         - alchemical_pecd(energy, dr, dq, reduced=True)
     )
 
 
-for energy in range(4, 11):
-    target = functools.partial(alchemical_pecd, energy)
-    drs = np.linspace(-0.5, 0.5, 20)
-    dqs = np.linspace(-0.5, 0.5, 20)
-    X, Y = np.meshgrid(drs, dqs)
-    Z = np.array([(target(dr, dq)) for dr, dq in zip(X.ravel(), Y.ravel())]).reshape(
-        X.shape
-    )
-    print(np.amax(Z), np.amin(Z))
-    levels = range(-10, 11)
-    plt.contourf(X, Y, Z, levels=levels, cmap="RdBu")
-    plt.colorbar()
+def plot_results_per_energy() -> None:
+    """
+    Plots the alchemical pecd and estimated uncertainty surfaces for a range of energies,
+    using a grid of displacement and charge perturbations.
 
-    target2 = functools.partial(estimated_uncertainty, energy)
-    Z2 = np.array([(target2(dr, dq)) for dr, dq in zip(X.ravel(), Y.ravel())]).reshape(
-        X.shape
-    )
-    cs = plt.contour(
-        X,
-        Y,
-        Z2,
-        levels=[
-            1,
-        ],
-        colors="white",
-        linewidths=0.8,
-    )
-    maxval = 0
-    pos = None
-    for item in cs.collections:
-        for i in item.get_paths():
-            v = i.vertices
-            xs = v[:, 0]
-            ys = v[:, 1]
-            for x, y in zip(xs, ys):
-                value = abs(target(x, y))
-                if value > maxval:
-                    maxval = value
-                    pos = (x, y)
-    print(pos, maxval)
-    plt.scatter(
-        (pos[0],), (pos[1],), color="yellow", s=50, edgecolors="grey", zorder=100
-    )
+    Returns
+    -------
+    None
 
-    plt.xlabel("dr [a.u.]")
-    plt.ylabel("dq [a.u.]")
-    plt.title("$\\beta_1$@E={}".format(energy))
-    plt.scatter(
-        (0, 0, 0, 0, 0),
-        (-0.2, -0.1, 0, 0.1, 0.2),
-        color="white",
-        edgecolors="grey",
-        zorder=100,
-    )
-    plt.scatter(
-        (-0.2, -0.1, 0, 0.1, 0.2),
-        (0, 0, 0, 0, 0),
-        color="white",
-        edgecolors="grey",
-        zorder=100,
-    )
-    plt.show()
+    Notes
+    -----
+    This function generates a set of contour plots that visualize the alchemical pecd and
+    estimated uncertainty surfaces for a range of electrostatic potential energies, using
+    a grid of displacement and charge perturbations. The range of energies is defined by
+    the integer values between 4 and 10, inclusive. For each energy value, the function
+    computes the pecd and estimated uncertainty at 20x20 evenly spaced grid points in
+    the [-0.5, 0.5] range for both the displacement and charge perturbations. It then
+    generates a contour plot of the pecd surface using a color map, and superimposes a
+    contour plot of the estimated uncertainty surface using white contour lines. The
+    maximum value is highlighted using a yellow dot. The x and y axes show
+    the displacement and charge perturbations, respectively, in atomic units.
+    """
+    for energy in range(4, 11):
+        target = functools.partial(alchemical_pecd, energy)
+        drs = np.linspace(-0.5, 0.5, 20)
+        dqs = np.linspace(-0.5, 0.5, 20)
+        X, Y = np.meshgrid(drs, dqs)
+        Z = np.array(
+            [(target(dr, dq)) for dr, dq in zip(X.ravel(), Y.ravel())]
+        ).reshape(X.shape)
+        print(np.amax(Z), np.amin(Z))
+        levels = range(-10, 11)
+        plt.contourf(X, Y, Z, levels=levels, cmap="RdBu")
+        plt.colorbar()
+
+        target2 = functools.partial(estimated_uncertainty, energy)
+        Z2 = np.array(
+            [(target2(dr, dq)) for dr, dq in zip(X.ravel(), Y.ravel())]
+        ).reshape(X.shape)
+        cs = plt.contour(
+            X,
+            Y,
+            Z2,
+            levels=[
+                1,
+            ],
+            colors="white",
+            linewidths=0.8,
+        )
+        maxval = 0
+        pos = None
+        for item in cs.collections:
+            for i in item.get_paths():
+                v = i.vertices
+                xs = v[:, 0]
+                ys = v[:, 1]
+                for x, y in zip(xs, ys):
+                    value = abs(target(x, y))
+                    if value > maxval:
+                        maxval = value
+                        pos = (x, y)
+        print(pos, maxval)
+        plt.scatter(
+            (pos[0],), (pos[1],), color="yellow", s=50, edgecolors="grey", zorder=100
+        )
+
+        plt.xlabel("dr [a.u.]")
+        plt.ylabel("dq [a.u.]")
+        plt.title("$\\beta_1$@E={}".format(energy))
+        plt.scatter(
+            (0, 0, 0, 0, 0),
+            (-0.2, -0.1, 0, 0.1, 0.2),
+            color="white",
+            edgecolors="grey",
+            zorder=100,
+        )
+        plt.scatter(
+            (-0.2, -0.1, 0, 0.1, 0.2),
+            (0, 0, 0, 0, 0),
+            color="white",
+            edgecolors="grey",
+            zorder=100,
+        )
+        plt.show()
 
 
 # %%
-# what if lower orders only?
-def compare_to_lower_order(dr: bool):
+
+
+def compare_to_lower_order(dr: bool) -> None:
+    """
+    Compares the alchemical pecd estimates obtained using the full and reduced versions
+    of the input data, for a range of photoelectron energies and perturbation
+    parameters.
+
+    Parameters
+    ----------
+    dr : bool
+        Whether to compare the alchemical pecd estimates for displacement or charge
+        perturbations. If True, the function compares the estimates obtained by varying
+        the displacement parameter and fixing the charge parameter at zero. If False,
+        the function compares the estimates obtained by varying the charge parameter and
+        fixing the displacement parameter at zero.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    This function compares the alchemical pecd estimates obtained using the full and
+    reduced versions of the input data, for a range of photoelectron energies
+    and perturbation parameters. Specifically, it computes the alchemical pecd estimates
+    for the specified perturbation parameter (displacement or charge) at a range of
+    energies between 4 and 10, inclusive, using both the full and reduced versions of
+    the input data. It then plots the resulting estimates as a function of energy, using
+    different colors for the full and reduced estimates, and labels them accordingly.
+    Additionally, it plots the estimates obtained by reversing the signs of the
+    perturbation parameters, to allow for a comparison with the original estimates. The
+    resulting plots show how the alchemical pecd estimates vary with the perturbation
+    parameters and the accuracy of the input data, and can be used to assess the
+    reliability of the alchemical perturbation method for different scenarios.
+    """
     if dr:
         plt.title("+- 0.2 from (+- 0.1, 0) for geometry")
         dr, dq = 0.2, 0.0
@@ -157,7 +319,36 @@ def compare_to_lower_order(dr: bool):
 compare_to_lower_order(True)
 compare_to_lower_order(False)
 # %%
-def through_energy(dr, dq):
+def through_energy(dr: float, dq: float) -> None:
+    """
+    Plots the alchemical pecd estimates obtained using the full and reduced versions of
+    the input data, as a function of photoelectron energy, for a fixed set of
+    displacement and charge perturbation parameters.
+
+    Parameters
+    ----------
+    dr : float
+        The displacement distance of the perturbed molecule, in Angstroms.
+    dq : float
+        The charge change of the perturbed molecule, in elementary charges.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    This function computes the alchemical pecd estimates obtained using the full and
+    reduced versions of the input data, as a function of photoelectron energy,
+    for a fixed set of displacement and charge perturbation parameters. Specifically,
+    it computes the alchemical pecd estimates for the specified perturbation parameters
+    at a range of energies between 4 and 10, inclusive, using both the full and reduced
+    versions of the input data. It then plots the resulting estimates as a function of
+    energy, using different colors for the full and reduced estimates, and labels them
+    accordingly. The resulting plot shows how the alchemical pecd estimates vary with
+    the photoelectron energy, and can be used to assess the reliability of
+    the alchemical perturbation method for the specified perturbation parameters.
+    """
     Es = range(4, 11)
     betas = [alchemical_pecd(_, dr, dq, reduced=False) for _ in Es]
     plt.plot(Es, betas, color="C0", label="reduced")
@@ -168,4 +359,4 @@ def through_energy(dr, dq):
 
 
 through_energy(0.5, 0.3)
-# %%
+# %%# %%
