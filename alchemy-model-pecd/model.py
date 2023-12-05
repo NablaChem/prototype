@@ -1,4 +1,4 @@
-#%%
+# %%
 BASEDIR = "/home/ferchault/wrk/prototype/alchemy-model-pecd"
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -47,6 +47,7 @@ def get_data(kind: str, reduced: bool = False) -> pd.DataFrame:
 # uncertainty from distance in dq/dr
 # discuss error as function of displacement
 
+
 # %%
 def central_finite_difference(displacement: float, values: np.ndarray) -> np.poly1d:
     """
@@ -92,6 +93,50 @@ def central_finite_difference(displacement: float, values: np.ndarray) -> np.pol
     return np.poly1d(pcoeffs[::-1])
 
 
+def forward_finite_difference(displacement: float, values: np.ndarray) -> np.poly1d:
+    """
+    Computes a polynomial approximation of the derivative of a function
+    using central finite differences.
+
+    Parameters
+    ----------
+    displacement : float
+        The spacing between adjacent values in the `values` array.
+    values : numpy.ndarray
+        An array of function values at equidistant points.
+
+    Returns
+    -------
+    p : numpy.poly1d
+        A polynomial function that approximates the derivative of the input function
+        using central finite differences. The polynomial's coefficients are determined
+        by fitting it to the input data. The polynomial's degree is determined by the
+        number of derivative orders that can be computed using the input values.
+
+    Raises
+    ------
+    AssertionError
+        If the length of the input `values` array is not odd.
+    """
+    assert len(values) % 2 == 1
+    order = 0
+    pcoeffs = [values[len(values) // 2]]
+    while True:
+        order += 1
+        for acc in (4, 2):
+            coeffs = findiff.coefficients(deriv=order, acc=acc)["forward"][
+                "coefficients"
+            ]
+            if len(coeffs) == len(values):
+                break
+        else:
+            break
+        pcoeffs.append(
+            np.sum(coeffs * values) / displacement**order / math.factorial(order)
+        )
+    return np.poly1d(pcoeffs[::-1])
+
+
 def alchemical_pecd(
     energy: float, dr: float, dq: float, reduced: bool = False
 ) -> float:
@@ -121,8 +166,10 @@ def alchemical_pecd(
     """
     line = get_data("charge", reduced=reduced).loc[energy].to_list()
     taylor_charge = central_finite_difference(0.1, np.array(line))
+    # print ("charge", taylor_charge)
     line = get_data("position", reduced=reduced).loc[energy].to_list()
     taylor_pos = central_finite_difference(0.1, np.array(line))
+    # print ("pos", taylor_pos)
     return (
         line[len(line) // 2]
         + taylor_charge(dq)
@@ -132,7 +179,7 @@ def alchemical_pecd(
     ) * 100
 
 
-#%%
+# %%
 def estimated_uncertainty(energy: float, dr: float, dq: float) -> float:
     """
     Estimates the uncertainty in the percentage change of electrostatic potential energy
@@ -305,20 +352,27 @@ def compare_to_lower_order(dr: bool) -> None:
         dr, dq = 0.0, 0.2
     Es = range(4, 11)
     betas = [alchemical_pecd(_, dr, dq, reduced=False) for _ in Es]
-    plt.plot(Es, betas, color="C0", label="reduced")
-    betas = [alchemical_pecd(_, dr, dq, reduced=True) for _ in Es]
-    plt.plot(Es, betas, color="C1", label="full")
+    plt.plot(Es, betas, color="C0", label="actual")
+    betas2 = [alchemical_pecd(_, dr, dq, reduced=True) for _ in Es]
+    plt.plot(Es, betas2, color="C1", label="prediction")
+    # print (np.abs(np.array(betas)-np.array(betas2)).mean())
 
     betas = [alchemical_pecd(_, -dr, -dq, reduced=False) for _ in Es]
     plt.plot(Es, betas, color="C0")
-    betas = [alchemical_pecd(_, -dr, -dq, reduced=True) for _ in Es]
-    plt.plot(Es, betas, color="C1")
+    betas2 = [alchemical_pecd(_, -dr, -dq, reduced=True) for _ in Es]
+    plt.plot(Es, betas2, color="C1")
+
+    # print (np.abs(np.array(betas)-np.array(betas2)).mean())
+    plt.xlabel("Energy [eV]")
+    plt.ylabel("beta")
     plt.legend()
     plt.show()
 
 
 compare_to_lower_order(True)
 compare_to_lower_order(False)
+
+
 # %%
 def through_energy(dr: float, dq: float) -> None:
     """
@@ -351,57 +405,45 @@ def through_energy(dr: float, dq: float) -> None:
     the alchemical perturbation method for the specified perturbation parameters.
     """
     Es = range(4, 11)
-    betas = [alchemical_pecd(_, dr, dq, reduced=False) for _ in Es]
-    plt.plot(Es, betas, color="C0", label="reduced")
+    # betas = [alchemical_pecd(_, dr, dq, reduced=False) for _ in Es]
+    # plt.plot(Es, betas, color="C0", label="reduced")
     betas = [alchemical_pecd(_, dr, dq, reduced=True) for _ in Es]
     plt.plot(Es, betas, color="C1", label="full")
     plt.legend()
-    plt.show()
 
 
-through_energy(0.5, 0.3)
 # %%
+def overview():
+    Es = (4, 6, 8, 10)
+
+    displacements = (-0.5, -0.4, -0.3, -0.2, -0.1, 0, 0.1, 0.2, 0.3, 0.4, 0.5)
+
+    f, axs = plt.subplots(ncols=len(Es), sharex=True, sharey=True, figsize=(20, 5))
+    import itertools as it
+
+    for energyidx in range(len(Es)):
+        data = [
+            [
+                alchemical_pecd(Es[energyidx], dr, dq, reduced=False)
+                for dq in displacements
+            ]
+            for dr in (+0.5,)
+        ]
+        _ = axs[energyidx].imshow(data, cmap="RdBu_r", vmin=-10, vmax=10)
+        axs[energyidx].set_title(f"{Es[energyidx]} eV")
+        axs[energyidx].set_xticks(range(len(displacements)), displacements)
+        axs[energyidx].set_yticks(range(len(displacements)), displacements)
+        axs[energyidx].set_xlabel("charge / dQ")
+
+        axs[0].set_ylabel("displacement / dR")
+        return data
+    plt.colorbar(_, ax=axs[-1])
 
 
-def build_krr(
-    energies: np.ndarray, drs: np.ndarray, dqs: np.ndarray, betas: np.ndarray
-) -> KernelRidge:
-    """
-    Builds a kernel ridge regression model to learn the relationship between the
-    photoelectron energies, displacement and charge perturbations, and the
-    corresponding alchemical pecd values.
-
-    Parameters
-    ----------
-    energies : np.ndarray
-        A 1D array of photoelectron energies used in the training set.
-    drs : np.ndarray
-        A 1D array of displacement perturbations used in the training set.
-    dqs : np.ndarray
-        A 1D array of charge perturbations used in the training set.
-    betas : np.ndarray
-        A 1D array of alchemical pecd values corresponding to the input energies, drs,
-        and dqs.
-
-    Returns
-    -------
-    model : sklearn.kernel_ridge.KernelRidge
-        A trained kernel ridge regression model that can be used to predict alchemical
-        pecd values for new sets of energy, displacement, and charge parameters.
-    """
-    # Stack the input arrays into a single feature matrix
-    X = np.column_stack([energies, drs, dqs])
-
-    # Create a kernel ridge regression model with a Gaussian radial basis function (RBF) kernel
-    model = KernelRidge(kernel="rbf")
-
-    # Train the model on the input data
-    model.fit(X, betas)
-
-    return model
+overview()
 
 
-#%%
+# %%
 def get_long_format_data():
     A = (
         get_data("charge")
@@ -536,3 +578,6 @@ def plot_krr_results():
             zorder=100,
         )
         plt.show()
+
+
+# %%
