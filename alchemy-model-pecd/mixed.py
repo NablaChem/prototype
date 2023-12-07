@@ -5,6 +5,7 @@ import numpy as np
 import collections
 import math
 import itertools as it
+from typing import Union
 
 
 class Monomial:
@@ -56,7 +57,10 @@ class MultiTaylor:
             del copy[output]
 
         copy.drop_duplicates(inplace=True)
-        if len(copy.columns) * len(copy.index) > 1:
+        if len(copy.index) > 1 and len(copy.columns) > 0:
+            print(copy)
+            print(copy.index)
+            print(copy.columns)
             raise ValueError(f"Terms {terms} are not unique. Is a filter missing?")
 
     def _split_term(self, term, order):
@@ -116,7 +120,17 @@ class MultiTaylor:
                 )
             )
 
-    def build_model(self, orders):
+    def _all_terms_up_to(self, order):
+        terms = {}
+        data_columns = [_ for _ in self._filtered.columns if _ not in self._outputs]
+        for order in range(1, order + 1):
+            terms[order] = [
+                "_".join(_)
+                for _ in it.combinations_with_replacement(data_columns, order)
+            ]
+        return terms
+
+    def build_model(self, orders: Union[int, dict[int, list[str]]]):
         # check center: there can be only one
         center_rows = self._dict_filter(self._dataframe, self._center)
         center_row = self._dict_filter(center_rows, self._filter)
@@ -127,6 +141,10 @@ class MultiTaylor:
 
         # setup constant term
         self._monomials = {k: [Monomial(center_row.iloc[0][k])] for k in self._outputs}
+
+        # accept integer as placeholder
+        if isinstance(orders, int):
+            orders = self._all_terms_up_to(orders)
 
         # setup other terms
         for order, terms in orders.items():
@@ -152,31 +170,6 @@ class MultiTaylor:
 
 
 # %%
-
-spatial = "RX RY RZ".split()
-electronic = "QX QY QZ".split()
-both = spatial + electronic
-
-
-def all_terms(terms, order):
-    return ["_".join(_) for _ in it.combinations_with_replacement(terms, order)]
-
-
-df = pd.read_csv(
-    "/home/ferchault/wrk/prototype/alchemy-model-pecd/big_table.dat", sep="\s+"
-)
-del df["Q0"]
-mt = MultiTaylor(df, outputs="BETA1 BETA2 SIGMA".split())
-mt.reset_center(RX=3, RY=3, RZ=3, QX=2.5, QY=2.5, QZ=2.5)
-mt.reset_filter(E=4)
-# mt.build_model({1: "RX".split()})
-# mt.build_model({2: "RX RY RZ RX_RY RX_RZ RY_RZ".split(), 3: "QX QY QZ".split()})
-mt.build_model({1: all_terms(both, 1), 2: all_terms(both, 2), 3: both})
-mt.query(RX=4, RY=3, RZ=3, QX=2.5, QY=2.5, QZ=2.5)
-mt.query(RX=5, RY=3, RZ=3, QX=2.5, QY=2.5, QZ=2.5)
-
-
-# %%
 def test_1d():
     for i in range(100):
         polynomial = np.poly1d(np.random.random(5))
@@ -191,5 +184,40 @@ def test_1d():
         assert abs(mt.query(x=5)["y"] - polynomial(5)) < 1e-4
 
 
-test_1d()
-# %%
+def test_2d():
+    polynomial = lambda A, B: A * B * B * B + B * B + A
+    A, B = 4, 5
+    dx = 0.1
+    As = (np.arange(5) - 2) * dx + A
+    Bs = (np.arange(5) - 2) * dx + B
+    As, Bs = np.meshgrid(As, Bs)
+    As = As.flatten()
+    Bs = Bs.flatten()
+    ys = polynomial(As, Bs)
+    df = pd.DataFrame({"A": As, "B": Bs, "y": ys})
+    mt = MultiTaylor(df, outputs=["y"])
+    mt.reset_center(A=4, B=5)
+    mt.build_model(4)
+    assert abs(mt.query(A=5, B=6)["y"] - polynomial(5, 6)) < 1e-4
+
+
+def test_3d():
+    polynomial = lambda A, B, C: A * B * C + B * B * C + A * C
+    A, B, C = 4, 5, 6
+    dx = 0.1
+    As = (np.arange(5) - 2) * dx + A
+    Bs = (np.arange(5) - 2) * dx + B
+    Cs = (np.arange(5) - 2) * dx + C
+    As, Bs, Cs = np.meshgrid(As, Bs, Cs)
+    As = As.flatten()
+    Bs = Bs.flatten()
+    Cs = Cs.flatten()
+    ys = polynomial(As, Bs, Cs)
+    df = pd.DataFrame({"A": As, "B": Bs, "C": Cs, "y": ys})
+    mt = MultiTaylor(df, outputs=["y"])
+    mt.reset_center(A=A, B=B, C=C)
+    mt.build_model(3)
+    assert (
+        abs(mt.query(A=A + 1, B=B + 1, C=C + 1)["y"] - polynomial(A + 1, B + 1, C + 1))
+        < 1e-4
+    )
