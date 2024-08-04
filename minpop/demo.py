@@ -7,7 +7,7 @@ import pyscf.gto
 import scipy.linalg
 
 
-def minpop(calculation: pyscf.scf.hf.RHF) -> np.ndarray:
+def minpop(calculation: pyscf.scf.hf.SCF) -> np.ndarray:
     """Implements the minimum population localization method.
 
     Follows:
@@ -18,43 +18,68 @@ def minpop(calculation: pyscf.scf.hf.RHF) -> np.ndarray:
 
     Parameters
     ----------
-    calculation : pyscf.scf.hf.RHF
-        A PySCF calculator object after a converged SCF.
+    calculation : pyscf.scf.hf.SCF
+        A PySCF calculator object after a converged SCF. May be of any subclass (e.g. RHF, UHF).
 
     Returns
     -------
     np.ndarray
         Populations on atoms. 2D, natoms x natoms.
     """
+    twochannel = calculation.mo_coeff.ndim == 3
     minimal = pyscf.gto.M(atom=calculation.mol.atom, basis="STO-3G")
 
     Sbar = pyscf.gto.intor_cross("int1e_ovlp", minimal, calculation.mol)
-    C = calculation.mo_coeff[:, calculation.mo_occ > 0]
     Sprime = minimal.intor("int1e_ovlp")
-
     Sprimeinv = np.linalg.inv(Sprime)
-    P = Sbar @ C
-    Cprime = P @ scipy.linalg.sqrtm(np.linalg.inv(C.T @ Sbar.T @ Sprimeinv @ P))
-    Cprime = Sprimeinv @ Cprime
-
-    pm = pyscf.lo.PM(minimal, Cprime)
-    pm.pop_method = "mulliken"
-    loc_orb = pm.kernel()
-
-    O = calculation.mo_occ[calculation.mo_occ > 0]
-    dm = (loc_orb * O) @ loc_orb.T
-    pop = np.einsum("ij,ji->ij", dm, Sprime).real
-
-    population = np.zeros((minimal.natm, minimal.natm))
     labels = minimal.ao_labels(fmt=None)
-    for i, si in enumerate(labels):
-        for j, sj in enumerate(labels):
-            population[si[0], sj[0]] += pop[i, j]
 
-    return population
+    def get_population(mo_coeff, mo_occ):
+        C = mo_coeff[:, mo_occ > 0]
+        P = Sbar @ C
+        Cprime = P @ scipy.linalg.sqrtm(np.linalg.inv(C.T @ Sbar.T @ Sprimeinv @ P))
+        Cprime = Sprimeinv @ Cprime
+
+        pm = pyscf.lo.PM(minimal, Cprime)
+        pm.pop_method = "mulliken"
+        loc_orb = pm.kernel()
+
+        O = mo_occ[mo_occ > 0]
+        dm = (loc_orb * O) @ loc_orb.T
+        pop = np.einsum("ij,ji->ij", dm, Sprime).real
+
+        population = np.zeros((minimal.natm, minimal.natm))
+        for i, si in enumerate(labels):
+            for j, sj in enumerate(labels):
+                population[si[0], sj[0]] += pop[i, j]
+
+        return population
+
+    if twochannel:
+        population_alpha = get_population(
+            calculation.mo_coeff[0], calculation.mo_occ[0]
+        )
+        population_beta = get_population(calculation.mo_coeff[1], calculation.mo_occ[1])
+        return population_alpha, population_beta
+    else:
+        if calculation.make_rdm1().ndim == 2:
+            population = get_population(calculation.mo_coeff, calculation.mo_occ)
+        else:
+            # ROHF
+            mo_occ = calculation.mo_occ.copy()
+            mo_occ[mo_occ == 1] = 0
+            population_same = get_population(calculation.mo_coeff, mo_occ)
+            mo_occ = calculation.mo_occ.copy()
+            mo_occ[mo_occ == 2] = 0
+            if max(mo_occ) > 0:
+                population_difference = get_population(calculation.mo_coeff, mo_occ)  #
+            else:
+                population_difference = 0
+            return population_same / 2 + population_difference, population_same / 2
+        return population
 
 
-def test_minpop():
+def test_refvalue():
     expected = b"""4.666698422564493853e+00 3.328309419908166977e-01 -2.536322754551907990e-02 8.468352021290422287e-04 1.426041824913102090e-03 -2.527656000146624379e-02 -1.728593461502366761e-03 3.801435749526757002e-01 3.825927880456000407e-01 3.801428762805373895e-01 -1.465537130959713389e-03 -1.752286938994341789e-05 -2.147372813029495221e-05 -2.142809717925411742e-05 1.507381289557632659e-05
 3.328309419908166422e-01 6.382457714081344768e+00 4.121917575670945300e-01 -4.531900430355957632e-02 -6.411211514655054677e-02 3.995277175716500651e-01 -2.113095396211587748e-02 -2.289276592746668573e-02 -2.088834280130299689e-02 -2.289312570471968220e-02 -2.370363830496060448e-02 1.113092328121627729e-03 -1.107545864709498160e-03 -1.108355490974264387e-03 9.426303837301457144e-04
 -2.536322754551908337e-02 4.121917575670945300e-01 4.737043254495979738e+00 4.867354339369313054e-01 -8.227499515907749084e-02 -7.557580479221449876e-02 1.257018467300605917e-03 7.827250906868221583e-04 -4.412150264012467370e-03 7.825895038038757721e-04 3.931407429830532929e-01 2.678752120229999523e-03 2.504267174007577000e-05 2.504326579908231268e-05 -2.975712557188968846e-05
@@ -78,4 +103,67 @@ def test_minpop():
     assert np.allclose(actual, expected, atol=1e-14)
 
 
-test_minpop()
+def test_UHF():
+    atomspec = """C 0.122391 0.0 0.088352
+    H -0.125474 0.0 1.136866
+    H 1.039556 0.0 -0.477002"""
+    calculation = pyscf.scf.UHF(pyscf.gto.M(atom=atomspec, basis="6-31+G", spin=2))
+    calculation.kernel()
+
+    actual = minpop(calculation)
+    expected_alpha = b"""3.886592882417463812e+00 1.716043296098384296e-01 1.716043867730661088e-01
+1.716043296098384019e-01 2.208935408180371374e-01 -7.398647077781335575e-03
+1.716043867730661365e-01 -7.398647077781335575e-03 2.208934381542567993e-01"""
+
+    expected_beta = b"""1.628031952438166563e+00 1.990799260906662704e-01 1.990800072660503794e-01
+1.990799260906662427e-01 2.988420498607952114e-01 -1.101784134782726049e-02
+1.990800072660503794e-01 -1.101784134782726049e-02 2.988418136832626248e-01"""
+
+    assert np.allclose(actual[0], np.genfromtxt(io.BytesIO(expected_alpha)), atol=1e-14)
+    assert np.allclose(actual[1], np.genfromtxt(io.BytesIO(expected_beta)), atol=1e-14)
+
+
+def test_ROHF_mult_1():
+    atomspec = """C 0.0 0.0 0.17535
+ H 0.0 0.86051 -0.52606
+ H 0.0 -0.86051 -0.52606"""
+    calculation = pyscf.scf.ROHF(pyscf.gto.M(atom=atomspec, basis="6-31+G", spin=0))
+    calculation.kernel()
+    actual = minpop(calculation)
+
+    expected = b"""5.498817636760263 0.328572504892756 0.328572504892756
+ 0.328572504892756 0.627368400521873 -0.033922228687513
+ 0.328572504892756 -0.033922228687513 0.627368400521873"""
+    actual = actual[0] + actual[1]
+    assert np.allclose(actual, np.genfromtxt(io.BytesIO(expected)), atol=1e-14)
+
+
+def test_ROHF_mult_3():
+    atomspec = """C 0.12239 0.0 0.08835 
+ H -0.12547 0.0 1.13687 
+ H 1.03956 0.0 -0.477"""
+    mol = pyscf.gto.M(atom=atomspec, basis="6-31+G", spin=2)
+    mol.cart = True
+    calculation = pyscf.scf.ROHF(mol)
+    calculation.kernel()
+    actual = minpop(calculation)
+
+    expected_alpha = b"""
+3.759982745966387  0.17640216301273   0.176402409880398
+0.17640216301273   0.274403368849757 -0.007198958246232
+0.176402409880398 -0.007198958246232  0.274402655890061"""
+    expected_beta = b"""1.759440270904161 0.19448955669746 0.194489822156817
+ 0.19448955669746   0.242377946778904 -0.011077174413572
+ 0.194489822156817 -0.011077174413572  0.242377373435523"""
+
+    assert np.allclose(actual[0], np.genfromtxt(io.BytesIO(expected_alpha)), atol=1e-14)
+    assert np.allclose(actual[1], np.genfromtxt(io.BytesIO(expected_beta)), atol=1e-14)
+
+
+test_refvalue()
+test_UHF()
+test_ROHF_mult_1()
+test_ROHF_mult_3()
+
+
+# %%
