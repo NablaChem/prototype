@@ -171,13 +171,6 @@ def test_gaussian_finite_diff():
     assert abs(deriv - deriv_analytical) < 1e-3
 
 
-# %%
-X, y = get_training_data(2, 10)
-kern = LinearCombination(RBF(), RBF())
-print(kern._parameters)
-kern.value(X, X, __0_prefactor=1, _0_sigma=1, __1_prefactor=1, _1_sigma=1)
-
-# %%
 import ase
 
 
@@ -201,6 +194,14 @@ class CoulombMatrix(Representation):
         return self._cm.create(mol)
 
 
+class Identity(Representation):
+    def prepare_for_dataset(self, dataset):
+        pass
+
+    def transform(self, point: np.ndarray):
+        return point
+
+
 class OptKRR:
     def __init__(
         self, kernel: Kernel, molecules: np.ndarray[ase.Atoms], labels: np.ndarray
@@ -209,18 +210,19 @@ class OptKRR:
         self._kernel.prepare_for_dataset(molecules)
         self._split_dataset(molecules, labels)
 
-    def _split_dataset(self, molecules: list[ase.Atoms], labels: np.ndarray):
-        ntotal = len(molecules)
-        print(f"Received dataset of {ntotal} molecules.")
-        molecules = np.array(molecules, dtype=object)
+    def _split_dataset(self, points: list[ase.Atoms] | np.ndarray, labels: np.ndarray):
+        ntotal = len(points)
+        print(f"Received dataset of {ntotal} points.")
+        if isinstance(points[0], ase.Atoms):
+            points = np.array(points, dtype=object)
         ntrain = int(0.8 * ntotal)
         nholdout = ntotal - ntrain
         if nholdout < 100:
             print("WARNING: Holdout set has only few data points.")
 
         train, holdout = OptKRR._random_indices(ntrain, ntotal)
-        self._training_data = (molecules[train], labels[train])
-        self._holdout_data = (molecules[holdout], labels[holdout])
+        self._training_data = (points[train], labels[train])
+        self._holdout_data = (points[holdout], labels[holdout])
 
     @staticmethod
     def _random_indices(take: int, total: int):
@@ -229,7 +231,7 @@ class OptKRR:
         return idx[:take], idx[take:]
 
     def _guess_parameters(self):
-        return {_: 1 for _ in self._kernel._parameters}
+        return {_: 1.0 for _ in self._kernel._parameters}
 
     def _get_rmse(self, train: np.ndarray, test: np.ndarray, parameters: dict):
         Xtrain = self._training_data[0][train]
@@ -239,18 +241,26 @@ class OptKRR:
 
         npts = len(train)
         lval = 1e-7  # TODO
-        K = kernel.value(Xtrain, Xtrain, **parameters)
-        alpha = np.linalg.inv(K.T + lval * np.identity(npts)) @ ytrain
+        K = self._kernel.value(Xtrain, Xtrain, **parameters)
+        beta = np.linalg.inv(K.T + lval * np.identity(npts))
+        alpha = beta @ ytrain
+        gradK = self._kernel.grad(Xtrain, Xtrain, **parameters)[0]
+        gradbeta = -np.linalg.inv(K) @ gradK @ np.linalg.inv(K)
 
-        K = kernel.value(Xtrain, Xtest, **parameters)
+        K = self._kernel.value(Xtrain, Xtest, **parameters)
+        gradK = self._kernel.grad(Xtrain, Xtest, **parameters)[0]
+
         pred = np.sum(K.T * alpha, axis=1)
-        return np.average((pred - ytest) ** 2)
+        gradhat = gradbeta @ ytrain @ K + beta @ ytrain @ gradK
+        deriv_analytical = -(2 * (pred - ytest) * gradhat).sum() / len(ytest)
+
+        return np.average((pred - ytest) ** 2), deriv_analytical
 
     @property
     def ntrain(self):
         return len(self._training_data[0])
 
-    def run(self, ntrain: int, nsubsplits: int = 5):
+    def run(self, ntrain: int, nsubsplits: int = 20):
         if ntrain > self.ntrain:
             raise ValueError(
                 f"Fewer than the requested {ntrain} data points available."
@@ -261,13 +271,44 @@ class OptKRR:
         ]
 
         start = self._guess_parameters()
-        rmses = [self._get_rmse(*_, start) for _ in subsplits]
-        print(np.array(rmses).mean())
+        print(f"Optimizing {len(start)} parameters for the given kernel.")
+        for i in range(20):
+            print(start)
+            rmse_and_grads = [self._get_rmse(*_, start) for _ in subsplits]
+
+            score = np.average([_[0] for _ in rmse_and_grads])
+            grad = np.median([_[1] for _ in rmse_and_grads])
+
+            print("SCORE", i, score, grad)
+            direction = grad / np.linalg.norm(grad)
+
+            # line scan
+            best_scale = 0
+            best_score = score
+            for scale in 2.0 ** np.arange(-7, 3):
+                start["sigma"] += direction * scale
+                score = np.average([self._get_rmse(*_, start)[0] for _ in subsplits])
+                if best_score is None or score < best_score:
+                    best_scale = scale
+                    best_score = score
+                start["sigma"] -= direction * scale
+            if best_scale == 0:
+                break
+            print(f"Line scan: {best_scale}")
+
+            start["sigma"] += direction * best_scale
 
 
-kernel = RBF(CoulombMatrix())
-opt = OptKRR(kernel, a[:500], l[:500])
-opt.run(199)
+# dataset = get_training_data()
+# kernel = RBF(Identity())
+# opt = OptKRR(kernel, a[:500], l[:500])
+# opt.run(199)
+
+X, y = get_training_data(3, 500)
+# kern = LinearCombination(RBF(Identity()), RBF(Identity()))
+
+opt = OptKRR(RBF(Identity()), X, y)
+opt.run(20)
 
 # %%
 import io
