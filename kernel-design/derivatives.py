@@ -1,6 +1,7 @@
 # %%
 import numpy as np
 import jax
+import time
 
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
@@ -61,7 +62,7 @@ class Kernel:
 
         jac = jax.jacfwd(self.calculate_value, argnums=2)(X, Xother, kwargs)
         jacs = []
-        for parameter in self._parameters:
+        for parameter in sorted(self._parameters):
             jacs.append(np.array(jac[parameter]))
 
         return Kernel._check_shape(
@@ -83,6 +84,10 @@ class LinearCombination(Kernel):
         for kernel_index, kernel in enumerate(self._kernels):
             self._parameters.append(f"__{kernel_index}_prefactor")
             self._parameters += [f"_{kernel_index}_{_}" for _ in kernel._parameters]
+
+    def prepare_for_dataset(self, dataset: list[ase.Atoms]):
+        for kernel in self._kernels:
+            kernel.prepare_for_dataset(dataset)
 
     def _get_subkwargs(self, kwargs, kernel_index):
         subkwargs = {}
@@ -115,8 +120,8 @@ class LinearCombination(Kernel):
             )
             kgrad = kernel.grad(X, Xother, *args, **subkwargs)
             for parameter, gradelement in zip(kernel._parameters, kgrad):
-                grad[f"{kernel_index}_{parameter}"] = gradelement
-        jacs = [grad[_] for _ in self._parameters]
+                grad[f"_{kernel_index}_{parameter}"] = gradelement
+        jacs = [grad[_] for _ in sorted(self._parameters)]
 
         return Kernel._check_shape(
             np.array(jacs), (len(self._parameters), X.shape[0], Xother.shape[0])
@@ -230,7 +235,7 @@ class OptKRR:
         np.random.shuffle(idx)
         return idx[:take], idx[take:]
 
-    def _guess_parameters(self):
+    def _guess_parameters(self) -> dict[str, float]:
         return {_: 1.0 for _ in self._kernel._parameters}
 
     def _get_rmse(self, train: np.ndarray, test: np.ndarray, parameters: dict):
@@ -241,20 +246,28 @@ class OptKRR:
 
         npts = len(train)
         lval = 1e-7  # TODO
-        K = self._kernel.value(Xtrain, Xtrain, **parameters)
-        beta = np.linalg.inv(K.T + lval * np.identity(npts))
+        Ktraintrain = self._kernel.value(Xtrain, Xtrain, **parameters)
+        beta = np.linalg.inv(Ktraintrain.T + lval * np.identity(npts))
         alpha = beta @ ytrain
-        gradK = self._kernel.grad(Xtrain, Xtrain, **parameters)[0]
-        gradbeta = -np.linalg.inv(K) @ gradK @ np.linalg.inv(K)
+        gradKs_traintrain = self._kernel.grad(Xtrain, Xtrain, **parameters)
+        gradKs_traintest = self._kernel.grad(Xtrain, Xtest, **parameters)
+        deriv_analytical = []
+        for parameter_idx in range(gradKs_traintrain.shape[0]):
+            gradbeta = (
+                -np.linalg.inv(Ktraintrain)
+                @ gradKs_traintrain[parameter_idx]
+                @ np.linalg.inv(Ktraintrain)
+            )
 
-        K = self._kernel.value(Xtrain, Xtest, **parameters)
-        gradK = self._kernel.grad(Xtrain, Xtest, **parameters)[0]
+            Ktraintest = self._kernel.value(Xtrain, Xtest, **parameters)
+            pred = np.sum(Ktraintest.T * alpha, axis=1)
+            gradhat = (
+                gradbeta @ ytrain @ Ktraintest
+                + beta @ ytrain @ gradKs_traintest[parameter_idx]
+            )
+            deriv_analytical.append(-(2 * (pred - ytest) * gradhat).sum() / len(ytest))
 
-        pred = np.sum(K.T * alpha, axis=1)
-        gradhat = gradbeta @ ytrain @ K + beta @ ytrain @ gradK
-        deriv_analytical = -(2 * (pred - ytest) * gradhat).sum() / len(ytest)
-
-        return np.average((pred - ytest) ** 2), deriv_analytical
+        return np.average((pred - ytest) ** 2), np.array(deriv_analytical)
 
     @property
     def ntrain(self):
@@ -272,43 +285,55 @@ class OptKRR:
 
         start = self._guess_parameters()
         print(f"Optimizing {len(start)} parameters for the given kernel.")
+        print("step | RMSE    | improvement | time | parameters")
+        firstscore = None
+        starttime = time.time()
         for i in range(20):
-            print(start)
             rmse_and_grads = [self._get_rmse(*_, start) for _ in subsplits]
 
             score = np.average([_[0] for _ in rmse_and_grads])
-            grad = np.median([_[1] for _ in rmse_and_grads])
+            if firstscore is None:
+                firstscore = score
+            grad = np.median([_[1] for _ in rmse_and_grads], axis=0)
 
-            print("SCORE", i, score, grad)
+            print(
+                f"{i:4} | {score:5.1e} | {firstscore / score:11.1f} | {time.time()-starttime:4.1f} | {start}"
+            )
+
             direction = grad / np.linalg.norm(grad)
+            # direction should not depend on param scale
 
             # line scan
-            best_scale = 0
+            best_scale = None
             best_score = score
             for scale in 2.0 ** np.arange(-7, 3):
-                start["sigma"] += direction * scale
+                for pidx, parameter in enumerate(sorted(self._kernel._parameters)):
+                    start[parameter] += direction[pidx] * scale
                 score = np.average([self._get_rmse(*_, start)[0] for _ in subsplits])
                 if best_score is None or score < best_score:
                     best_scale = scale
                     best_score = score
-                start["sigma"] -= direction * scale
-            if best_scale == 0:
+                for pidx, parameter in enumerate(sorted(self._kernel._parameters)):
+                    start[parameter] -= direction[pidx] * scale
+            if best_scale is None:
                 break
-            print(f"Line scan: {best_scale}")
 
-            start["sigma"] += direction * best_scale
+            for pidx, parameter in enumerate(sorted(self._kernel._parameters)):
+                start[parameter] += direction[pidx] * best_scale
 
 
 # dataset = get_training_data()
 # kernel = RBF(Identity())
 # opt = OptKRR(kernel, a[:500], l[:500])
 # opt.run(199)
+if __name__ == "__main__":
+    X, y = get_training_data(3, 500)
+    # kern = LinearCombination(RBF(Identity()), RBF(Identity()))
 
-X, y = get_training_data(3, 500)
-# kern = LinearCombination(RBF(Identity()), RBF(Identity()))
+    # opt = OptKRR(RBF(Identity()), X, y)
+    opt = OptKRR(LinearCombination(RBF(Identity()), RBF(Identity())), X, y)
+    opt.run(20)
 
-opt = OptKRR(RBF(Identity()), X, y)
-opt.run(20)
 
 # %%
 import io
@@ -334,7 +359,7 @@ def get_local_QMspin_database():
     return np.array(atoms, dtype=object), np.array(labels)
 
 
-a, l = get_local_QMspin_database()
+# a, l = get_local_QMspin_database()
 
 # %%
 import requests
