@@ -2,7 +2,6 @@
 from __future__ import annotations
 import numpy as np
 import jax
-import functools
 import time
 import ase
 
@@ -70,7 +69,8 @@ class Kernel:
     ):
         X = self._dataset.split_points(split_idx, npts, training)
         if isinstance(X[0], ase.Atoms):
-            X = np.array([self._representation.transform(_, rep_params) for _ in X])
+            X = [self._representation.transform(_, rep_params) for _ in X]
+            X = np.array(X)
         return X
 
     def _split_params(parameters: dict):
@@ -113,16 +113,15 @@ class Kernel:
     def prepare_for_dataset(self, dataset: list[ase.Atoms]):
         self._cache = {}
         self._dataset = dataset
-        try:
+        if self._representation is not None:
             self._representation.prepare_for_dataset(dataset)
-        except:
-            pass
 
 
 class LinearCombination(Kernel):
     def __init__(self, *args: tuple[Kernel]):
         self._parameters = []
         self._kernels = list(args)
+        self._representation = None
 
         for kernel_index, kernel in enumerate(self._kernels):
             self._parameters.append(f"__{kernel_index}_prefactor")
@@ -226,7 +225,7 @@ import dscribe.descriptors
 
 class CoulombMatrix(Representation):
     def prepare_for_dataset(self, dataset: list[ase.Atoms]):
-        maxatoms = max([len(_) for _ in dataset])
+        maxatoms = max([len(_) for _ in dataset.allpoints])
         self._cm = dscribe.descriptors.CoulombMatrix(n_atoms_max=maxatoms)
 
     def transform(self, mol: ase.Atoms, parameters: dict):
@@ -247,6 +246,7 @@ class Dataset:
         data_points: np.ndarray[ase.Atoms] | np.ndarray[float],
         labels: np.ndarray,
         nsplits: int,
+        restrict_training: int = 500,
     ):
         if isinstance(data_points[0], ase.Atoms):
             self._data_points = np.array(data_points, dtype=object)
@@ -255,10 +255,20 @@ class Dataset:
 
         self._labels = labels
         self._split(nsplits)
+        self._restrict_training = restrict_training
+
+    @property
+    def nullmodel(self) -> float:
+        values = self._labels
+        return np.sqrt(np.average((values - np.average(values)) ** 2))
 
     @property
     def npoints(self) -> int:
         return len(self._data_points)
+
+    @property
+    def allpoints(self):
+        return self._data_points
 
     @property
     def ntrain(self) -> int:
@@ -291,14 +301,37 @@ class Dataset:
         if training:
             idx = idx[:npts]
         else:
-            idx = idx[npts:]
-        return idx
+            idx = idx[npts : npts + self._restrict_training]
+        return self._training_indices[idx]
 
     def split_labels(self, split_idx, npts, training):
         return self._labels[self._split_idx(split_idx, npts, training)]
 
     def split_points(self, split_idx, npts, training):
         return self._data_points[self._split_idx(split_idx, npts, training)]
+
+    def detrend_by_atom(self):
+        # find all elements
+        elements = set()
+        for molecule in self._data_points[self._training_indices]:
+            elements |= set(molecule.get_atomic_numbers())
+        elements = sorted(list(elements))
+
+        # fit on training data
+        A = np.zeros((self.ntrain, len(elements)))
+        for midx, molecule in enumerate(self._data_points[self._training_indices]):
+            for number in molecule.get_atomic_numbers():
+                A[midx, elements.index(number)] += 1
+
+        b = self._labels[self._training_indices]
+        x = np.linalg.lstsq(A, b, rcond=None)[0]
+
+        # apply to all data
+        A = np.zeros((self.npoints, len(elements)))
+        for midx, molecule in enumerate(self._data_points):
+            for number in molecule.get_atomic_numbers():
+                A[midx, elements.index(number)] += 1
+        self._labels -= np.dot(A, x)
 
 
 def get_training_data(ndim, npts):
@@ -307,7 +340,7 @@ def get_training_data(ndim, npts):
 
     X = np.random.uniform(0, 1, size=(npts, ndim))
     y = testfun(X)
-    return Dataset(X, y, 5)
+    return Dataset(X, y, 100)
 
 
 class OptKRR:
@@ -326,7 +359,7 @@ class OptKRR:
     def _score(self, npts: int, parameters: dict, include_grad=False):
         avgs = []
         derivs = []
-        lval = 1e-7  # TODO
+        lval = 1e-14  # TODO
         for split_idx in range(self._dataset.nsplits):
             ytrain = self._dataset.split_labels(split_idx, npts, True)
             ytest = self._dataset.split_labels(split_idx, npts, False)
@@ -418,18 +451,6 @@ class OptKRR:
                 start[parameter] += direction[pidx] * best_scale
 
 
-# dataset = get_training_data()
-# kernel = RBF(Identity())
-# opt = OptKRR(kernel, a[:500], l[:500])
-# opt.run(199)
-if __name__ == "__main__":
-    ds = get_training_data(3, 500)
-    kernel = RBF(Identity())
-    opt = OptKRR(kernel, ds)
-    opt.run(100)
-
-
-# %%
 import io
 import glob
 import ase.io
@@ -453,7 +474,22 @@ def get_local_QMspin_database():
     return np.array(atoms, dtype=object), np.array(labels)
 
 
-# a, l = get_local_QMspin_database()
+# dataset = get_training_data()
+# kernel = RBF(Identity())
+# opt = OptKRR(kernel, a[:500], l[:500])
+# opt.run(199)
+if __name__ == "__main__":
+    # ds = get_training_data(5, 500)
+
+    qmspin = Dataset(*get_local_QMspin_database(), 20)
+    qmspin.detrend_by_atom()
+    print("Nullmodel", qmspin.nullmodel)
+    kernel = RBF(CoulombMatrix())
+    opt = OptKRR(kernel, qmspin)
+    opt.run(100)
+
+
+# %%
 
 # %%
 import requests
