@@ -1,45 +1,50 @@
 # %%
-# Free energies of deprotonation in solvent of molecule M
-# 1. Get conformers of M with a wide energy range: M_i, e.g. from xTB
-# 2. Relax conformers in solvent
-# 3. Enumerate protonation states: 2^n for n protons
-# 4. For each protonation state, for each conformer: apply protonation state, relax conformer, get free energy
-# ??? Choose reference protonation state for alchemy
-from pyscf import gto
-from pyscf.hessian import thermo
-
-# from pyscf.solvent import pcm
-# from pyscf import scf
-
-# First compute nuclear Hessian.
-mol = gto.M(
-    atom="""O    0.   0.       0
-              H    0.   -0.757   0.587
-              H    0.    0.757   0.587""",
-    basis="631g",
-)
-
-mf = mol.RHF().PCM()
-mf.run()
-hessian = mf.Hessian().kernel()
-
-# Frequency analysis
-freq_info = thermo.harmonic_analysis(mf.mol, hessian)
-# Thermochemistry analysis at 298.15 K and 1 atmospheric pressure
-thermo.thermo(mf, freq_info["freq_au"], 298.15, 101325)["G_tot"]
-
-# %%
 import itertools as it
-import pyscf
-import pyscf.dft
-from pyscf.hessian import thermo
-import pyscf.solvent.pcm
 import rdkit
 import rdkit.Chem.AllChem
 import rdkit.Chem.rdDistGeom
-import py3Dmol
 import numpy as np
+import pandas as pd
 import scipy.spatial.distance as ssd
+import hmq
+
+
+@hmq.task
+def qm_calculation(
+    atomspec: str,
+    basis: str,
+    charge: int,
+    epsilon: float,
+    geo_opt: bool,
+    free_energy: bool,
+    label: int,
+) -> dict:
+    import pyscf
+    import pyscf.dft
+    from pyscf.hessian import thermo
+    import pyscf.solvent.pcm
+
+    mol = pyscf.gto.M(atom=atomspec, basis=basis, charge=charge, verbose=0)
+    mf = pyscf.dft.RKS(mol, xc="B3LYP").PCM()
+    mf.eps = epsilon
+    results = {"label": label}
+
+    if geo_opt:
+        mol = mf.Gradients().optimizer(solver="geomeTRIC").kernel()
+        results["opt_geo"] = mol.atom_coords(unit="Ang")
+        mf = pyscf.dft.RKS(mol, xc="B3LYP").PCM()
+        mf.eps = epsilon
+
+    if free_energy:
+        mf.run()
+        hessian = mf.Hessian().kernel()
+
+        freq_info = thermo.harmonic_analysis(mf.mol, hessian)
+        results["free_energy"] = thermo.thermo(
+            mf, freq_info["freq_au"], 298.15, 101325
+        )["G_tot"][0]
+
+    return results
 
 
 class System:
@@ -73,7 +78,7 @@ class System:
         self._remove_duplicate_conformers()
         print(f"Found {len(self._conformers)} conformers.")
 
-    def _build_atomspec(self, confid, protonation_state: list[int] = None):
+    def _build_atomspec(self, confid, protonation_state: list[int]):
         atomspec = []
         seen_hydrogens = 0
         for i, atom in enumerate(self._elements):
@@ -84,16 +89,18 @@ class System:
             atomspec.append((atom, self._conformers[confid][i]))
         return atomspec
 
-    def optimize_conformers(self):
+    def optimize_conformers(self, epsilon: float):
         """Lifts conformer geometries to quantum chemistry level in solvent."""
         for conf in range(len(self._conformers)):
-            atomspec = self._build_atomspec(conf)
-            mol = pyscf.gto.M(
-                atom=atomspec, basis=self._basis, charge=self._charge, verbose=0
+            atomspec = self._build_atomspec(conf, [1] * self.nprotons)
+            qm_calculation(
+                atomspec, self._basis, self._charge, epsilon, True, False, conf
             )
-            mf = pyscf.dft.RKS(mol, xc="B3LYP").PCM()
-            mol_opt = mf.Gradients().optimizer(solver="geomeTRIC").kernel()
-            self._conformers[conf] = mol_opt.atom_coords(unit="Ang")
+        tag = qm_calculation.submit()
+        tag.pull(blocking=True)
+        for result in tag.results:
+            conf = result["label"]
+            self._conformers[conf] = result["opt_geo"]
         self._remove_duplicate_conformers()
         print(f"Kept {len(self._conformers)} conformers after solvation.")
 
@@ -122,44 +129,62 @@ class System:
         for i in it.product((0, 1), repeat=self.nprotons):
             yield i
 
-    def canonical_calculation(
-        self, confid: int, protonation_state: list[int], relax: bool
+    def get_free_energies(
+        self, epsilon: float, limit_k_body: int = None, random_sample: int = None
     ):
-        atomspec = self._build_atomspec(confid, protonation_state)
-        nremoved = len(protonation_state) - sum(protonation_state)
-        mol = pyscf.gto.M(
-            atom=atomspec, basis=self._basis, charge=self._charge - nremoved, verbose=0
+        pstates = []
+        kbodies = []
+        for pstate in self.protonation_states():
+            if limit_k_body is not None:
+                kbody = len(pstate) - sum(pstate)
+                if kbody > limit_k_body:
+                    pstates.append(pstate)
+                else:
+                    kbodies.append(kbody)
+
+        if random_sample is None:
+            pstates = kbodies
+        else:
+            pstates = list(np.random.choice(pstates, random_sample, replace=False))
+            pstates += kbodies
+
+        for pstate in pstates:
+            for confid in range(self.nconfomers):
+                atomspec = self._build_atomspec(confid, pstate)
+                nremoved = len(pstate) - sum(pstate)
+
+                qm_calculation(
+                    atomspec,
+                    self._basis,
+                    self._charge - nremoved,
+                    epsilon,
+                    True,
+                    True,
+                    (confid, pstate),
+                )
+        tag = qm_calculation.submit()
+        tag.pull(blocking=True)
+        results = tag.results
+        confids = [result["label"][0] for result in results]
+        protonations = [result["label"][1] for result in results]
+        geometries = [result["opt_geo"] for result in results]
+        free_energies = [result["free_energy"] for result in results]
+        kchanged = [len(p) - sum(p) for p in protonations]
+        return pd.DataFrame(
+            {
+                "confid": confids,
+                "protonation": protonations,
+                "geometry": geometries,
+                "free_energy": free_energies,
+                "kchanged": kchanged,
+            }
         )
 
-        mf = pyscf.dft.RKS(mol, xc="B3LYP").PCM()
-        if relax:
-            mol = mf.Gradients().optimizer(solver="geomeTRIC").kernel()
-            mf = pyscf.dft.RKS(mol, xc="B3LYP").PCM()
-        mf.run()
-        hessian = mf.Hessian().kernel()
 
-        freq_info = thermo.harmonic_analysis(mf.mol, hessian)
-        return thermo.thermo(mf, freq_info["freq_au"], 298.15, 101325)["G_tot"][0]
-
-
-# s = System("C(C(O)=O)1CC[N+]([H])([H])C(C(=O)O)C1", "6-31G", 1)
-s = System("C=C", "6-31G", 0)
+s = System("C(C(O)=O)1CC[N+]([H])([H])C(C(=O)O)C1", "6-31G", 1)
+# s = System("C=C", "6-31G", 0)
+# s = System("Cc1ccc(cc1Nc2nccc(n2)c3cccnc3)NC(=O)c4ccc(cc4)CN5CCN(CC5)C", "6-31G", 0)
 s.find_conformers()
-s.optimize_conformers()
-
-
-for pstate in s.protonation_states():
-    print(pstate)
-    for confid in range(s.nconfomers):
-        print(s.canonical_calculation(confid, pstate, True))
-#    base_free_energy = compute_free_energy(mol)
-#    for conf in conformers:
-#        conf = apply_protonation_state(conf, pstate)
-#        conf = geo_opt(conf)
-#        free_energy = compute_free_energy(conf)
-#        delta_free_energy = free_energy - base_free_energy
-# eq2 from paper
-# save result
-
-
-# %%
+water_eps = 78.5
+s.optimize_conformers(water_eps)
+results = s.get_free_energies(water_eps)
