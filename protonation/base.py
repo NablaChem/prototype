@@ -5,6 +5,7 @@ import rdkit.Chem.AllChem
 import rdkit.Chem.rdDistGeom
 import numpy as np
 import pandas as pd
+import random
 import scipy.spatial.distance as ssd
 import hmq
 
@@ -17,7 +18,7 @@ def qm_calculation(
     epsilon: float,
     geo_opt: bool,
     free_energy: bool,
-    label: int,
+    label,
 ) -> dict:
     import pyscf
     import pyscf.dft
@@ -89,7 +90,7 @@ class System:
             atomspec.append((atom, self._conformers[confid][i]))
         return atomspec
 
-    def optimize_conformers(self, epsilon: float):
+    def optimize_conformers(self, epsilon: float) -> str:
         """Lifts conformer geometries to quantum chemistry level in solvent."""
         for conf in range(len(self._conformers)):
             atomspec = self._build_atomspec(conf, [1] * self.nprotons)
@@ -97,12 +98,15 @@ class System:
                 atomspec, self._basis, self._charge, epsilon, True, False, conf
             )
         tag = qm_calculation.submit()
+        return tag.name
+
+    def load_conformers(self, tag: str):
+        tag = hmq.Tag.from_queue(tag)
         tag.pull(blocking=True)
+        self._conformers = [None] * len(tag.results)
         for result in tag.results:
             conf = result["label"]
             self._conformers[conf] = result["opt_geo"]
-        self._remove_duplicate_conformers()
-        print(f"Kept {len(self._conformers)} conformers after solvation.")
 
     def _remove_duplicate_conformers(self):
         kept = [self._conformers[0]]
@@ -125,28 +129,58 @@ class System:
     def nprotons(self):
         return len([atom for atom in self._elements if atom == "H"])
 
-    def protonation_states(self):
-        for i in it.product((0, 1), repeat=self.nprotons):
-            yield i
-
     def get_free_energies(
-        self, epsilon: float, limit_k_body: int = None, random_sample: int = None
+        self, epsilon: float, all_k_body: int = None, rest_random_sample: int = None
     ):
         pstates = []
-        kbodies = []
-        for pstate in self.protonation_states():
-            if limit_k_body is not None:
-                kbody = len(pstate) - sum(pstate)
-                if kbody > limit_k_body:
-                    pstates.append(pstate)
-                else:
-                    kbodies.append(kbody)
+        # build list of all k-body protonation states
+        if all_k_body is not None:
+            pstates.append([1] * self.nprotons)
 
-        if random_sample is None:
-            pstates = kbodies
+            for k in range(1, all_k_body + 1):
+                for skipped in it.combinations(range(self.nprotons), k):
+                    state = [1] * self.nprotons
+                    for site in skipped:
+                        state[site] = 0
+                    pstates.append(state)
+
+            # build list of random additional protonation states
+            if rest_random_sample is not None:
+                total_states = 2**self.nprotons
+                included = len(pstates)
+                nremaining = total_states - included
+                if nremaining <= rest_random_sample:
+                    # everything needs to be included
+                    pstates = [
+                        list(_) for _ in it.product((0, 1), repeat=self.nprotons)
+                    ]
+                elif nremaining < 10 * rest_random_sample:
+                    # probably can be built in memory
+                    all_states = list(it.product((0, 1), repeat=self.nprotons))
+                    remaining = [_ for _ in all_states if _ not in pstates]
+                    selected = random.sample(
+                        range(len(remaining)), k=rest_random_sample
+                    )
+                    pstates += [list(remaining[_]) for _ in selected]
+                else:
+                    # may not fit in memory
+                    fstring = "{0:0" + str(self.nprotons) + "b}"
+                    while True:
+                        to_choose = included + rest_random_sample - len(pstates)
+                        if to_choose == 0:
+                            break
+
+                        # random numbers, then convert to binary == protonation state
+                        selected = random.sample(range(2**self.nprotons), k=to_choose)
+                        selected = [list(map(int, fstring.format(_))) for _ in selected]
+                        selected = [_ for _ in selected if _ not in pstates]
+                        pstates += selected
         else:
-            pstates = list(np.random.choice(pstates, random_sample, replace=False))
-            pstates += kbodies
+            if rest_random_sample is not None:
+                raise NotImplementedError("Random sampling without all k-body states.")
+
+            # build list of all protonation states
+            pstates = [list(_) for _ in it.product((0, 1), repeat=self.nprotons)]
 
         for pstate in pstates:
             for confid in range(self.nconfomers):
@@ -162,8 +196,12 @@ class System:
                     True,
                     (confid, pstate),
                 )
-        tag = qm_calculation.submit()
-        tag.pull(blocking=True)
+        tag = qm_calculation.submit(ncores=4)
+        return tag.name
+
+    def load_free_energies(self, tag: str):
+        tag = hmq.Tag.from_queue(tag)
+        tag.pull()
         results = tag.results
         confids = [result["label"][0] for result in results]
         protonations = [result["label"][1] for result in results]
@@ -185,6 +223,15 @@ s = System("C(C(O)=O)1CC[N+]([H])([H])C(C(=O)O)C1", "6-31G", 1)
 # s = System("C=C", "6-31G", 0)
 # s = System("Cc1ccc(cc1Nc2nccc(n2)c3cccnc3)NC(=O)c4ccc(cc4)CN5CCN(CC5)C", "6-31G", 0)
 s.find_conformers()
+#
+# s.optimize_conformers(water_eps)
+s.load_conformers("qm_calculation_1469f5d3-7a4b-41e8-9b33-ac86a9c984c6")
+# results = s.get_free_energies(water_eps)
+
+# %%
+# "C(C(O)=O)1CC[N+]([H])([H])C(C(=O)O)C1", 6-31G, 1
+# conformers: qm_calculation_1469f5d3-7a4b-41e8-9b33-ac86a9c984c6
+# free energies: qm_calculation_10a16bb1-dcdb-4fac-9215-6e0be369c9c3
 water_eps = 78.5
-s.optimize_conformers(water_eps)
-results = s.get_free_energies(water_eps)
+s.get_free_energies(water_eps, 2, 100)
+# %%
