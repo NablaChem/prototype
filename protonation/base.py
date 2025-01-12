@@ -48,6 +48,86 @@ def qm_calculation(
     return results
 
 
+@hmq.task
+def qm_calculation(
+    atomspec: str,
+    basis: str,
+    charge: int,
+    epsilon: float,
+    geo_opt: bool,
+    free_energy: bool,
+    label,
+) -> dict:
+    import os
+    import subprocess
+
+    env = {
+        "PATH": os.getenv("PATH")
+        + ":/home/groups/nablachem/opt/orca_6_0_0_shared_openmpi416"
+    }
+    kind = "OPT" if geo_opt else "SP"
+    freq = "FREQ" if free_energy else ""
+    modatomspec = ""
+    for atom in atomspec:
+        modatomspec += f"{atom[0]} {atom[1][0]} {atom[1][1]} {atom[1][2]}\n"
+
+    inputfile = f"""! B3LYP {basis} {kind} {freq} CPCM(water)
+%cpcm
+   smd true
+   SMDSolvent "water"
+   epsilon {epsilon}
+end
+* xyz {charge} 1
+{modatomspec}
+*
+"""
+
+    with open("run.inp", "w") as fh:
+        fh.write(inputfile)
+    subprocess.run(["orca", "run.inp"], env=env)
+
+    try:
+        with open("run.property.txt") as fh:
+            content = fh.read().split("\n")
+    except:
+        raise ValueError(f"ORCA did not produce output: {inputfile}")
+
+    # did not fail?
+    if (
+        len(
+            [
+                line
+                for line in content
+                if '&STATUS [&Type "String"] "NORMAL TERMINATION"' in line
+            ]
+        )
+        == 0
+    ):
+        raise ValueError(f"ORCA did not terminate normally: {inputfile}")
+
+    results = {"label": label}
+
+    if geo_opt:
+        natoms = len(atomspec)
+        bohr = False
+        for lineidx in range(len(content)):
+            if "CartesianCoordinates" in content[lineidx]:
+                if "Bohr" in content[lineidx]:
+                    bohr = True
+                results["opt_geo"] = content[lineidx + 1 : lineidx + 1 + natoms]
+        for i, line in enumerate(results["opt_geo"]):
+            results["opt_geo"][i] = list(map(float, line.strip().split()[1:]))
+        results["opt_geo"] = np.array(results["opt_geo"])
+        if bohr:
+            results["opt_geo"] /= 1.8897259886
+
+    if free_energy:
+        line = [line for line in content if "FREEENERGYG" in line][0]
+        results["free_energy"] = float(line.split()[-1])
+
+    return results
+
+
 class System:
     def __init__(
         self,
@@ -219,6 +299,7 @@ class System:
         )
 
 
+# %%
 s = System("C(C(O)=O)1CC[N+]([H])([H])C(C(=O)O)C1", "6-31G", 1)
 # s = System("C=C", "6-31G", 0)
 # s = System("Cc1ccc(cc1Nc2nccc(n2)c3cccnc3)NC(=O)c4ccc(cc4)CN5CCN(CC5)C", "6-31G", 0)
@@ -227,11 +308,3 @@ s.find_conformers()
 # s.optimize_conformers(water_eps)
 s.load_conformers("qm_calculation_1469f5d3-7a4b-41e8-9b33-ac86a9c984c6")
 # results = s.get_free_energies(water_eps)
-
-# %%
-# "C(C(O)=O)1CC[N+]([H])([H])C(C(=O)O)C1", 6-31G, 1
-# conformers: qm_calculation_1469f5d3-7a4b-41e8-9b33-ac86a9c984c6
-# free energies: qm_calculation_10a16bb1-dcdb-4fac-9215-6e0be369c9c3
-water_eps = 78.5
-s.get_free_energies(water_eps, 2, 100)
-# %%
